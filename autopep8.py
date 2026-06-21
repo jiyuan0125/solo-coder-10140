@@ -115,6 +115,35 @@ COMPARE_TYPE_REGEX = re.compile(
 )
 TYPE_REGEX = re.compile(r'(type\s*\(\s*[^)]*?[^\s)]\s*\))')
 
+RISKY_EQ_OVERLOAD_IDENTS = re.compile(
+    r'\b('
+    r'np\.|numpy\.|pd\.|pandas\.|sqlalchemy\.|sa\.|'
+    r'Column|Integer|String|Float|Boolean|Date|DateTime|Text|'
+    r'Mock|MagicMock|NonCallableMock|PropertyMock|AsyncMock|'
+    r'ndarray|DataFrame|Series|Panel|'
+    r'torch\.|tf\.|tensorflow\.|keras\.|'
+    r'sympy\.|scipy\.|'
+    r'pint\.|'
+    r'Quantity|Unit|'
+    r'Decimal|Fraction|'
+    r'pathlib\.|Path|PurePath|'
+    r'pendulum\.|arrow\.|'
+    r'httpx\.|requests\.|aiohttp\.|'
+    r'BeautifulSoup|bs4\.'
+    r')\b'
+)
+
+CHAINED_COMPARE_REGEX = re.compile(
+    r'(?:'
+    r'[=!<>]=\s*$'
+    r'|^\s*[=!<>]='
+    r'|(?<![=!<>])[<>]\s*$'
+    r'|^\s*(?<![=!<>])[<>](?![=!<>])'
+    r')'
+)
+
+SIMPLE_IDENT_REGEX = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
 EXIT_CODE_OK = 0
 EXIT_CODE_ERROR = 1
 EXIT_CODE_EXISTS_DIFF = 2
@@ -173,33 +202,79 @@ def open_with_encoding(filename, mode='r', encoding=None, limit_byte_check=-1):
 
 
 def _detect_encoding_from_file(filename: str):
+    """Try to detect encoding via BOM or magic comment.
+
+    Returns tuple (encoding, explicitly_declared).
+    explicitly_declared is True when BOM or magic comment was found.
+    """
     try:
-        with open(filename) as input_file:
-            for idx, line in enumerate(input_file):
-                if idx == 0 and line[0] == '\ufeff':
-                    return "utf-8-sig"
+        with open(filename, 'rb') as input_file:
+            raw = input_file.read(MAX_PYTHON_FILE_DETECTION_BYTES)
+            if raw.startswith(codecs.BOM_UTF8):
+                return ("utf-8-sig", True)
+            # Use latin-1 to decode for magic-comment search because PEP 263
+            # only requires ASCII-range characters to be identifiable, and
+            # latin-1 will never raise on any byte sequence.
+            sample = raw.decode('latin-1').splitlines()
+            for idx, line in enumerate(sample):
                 if idx >= 2:
                     break
                 match = ENCODING_MAGIC_COMMENT.search(line)
                 if match:
-                    return match.groups()[0]
+                    return (match.groups()[0], True)
     except Exception:
         pass
-    # Python3's default encoding
-    return 'utf-8'
+    return ('utf-8', False)
 
 
 def detect_encoding(filename, limit_byte_check=-1):
-    """Return file encoding."""
-    encoding = _detect_encoding_from_file(filename)
+    """Return file encoding.
+
+    Raises UnspecifiedEncodingError if the file has no BOM, no magic
+    comment, and its bytes are not valid UTF-8.
+    """
+    encoding, explicitly_declared = _detect_encoding_from_file(filename)
     if encoding == "utf-8-sig":
         return encoding
     try:
         with open_with_encoding(filename, encoding=encoding) as test_file:
             test_file.read(limit_byte_check)
         return encoding
-    except (LookupError, SyntaxError, UnicodeDecodeError):
-        return 'latin-1'
+    except (LookupError, SyntaxError, UnicodeDecodeError) as exc:
+        if explicitly_declared:
+            return 'latin-1'
+        reasons = []
+        with open(filename, 'rb') as rb:
+            head = rb.read(4)
+        if not head.startswith(codecs.BOM_UTF8):
+            reasons.append("missing UTF-8 BOM")
+        with open(filename, 'rb') as rb2:
+            raw = rb2.read(MAX_PYTHON_FILE_DETECTION_BYTES)
+            found_magic = False
+            try:
+                for idx, line in enumerate(raw.decode('latin-1').splitlines()):
+                    if idx >= 2:
+                        break
+                    if ENCODING_MAGIC_COMMENT.search(line):
+                        found_magic = True
+                        break
+            except Exception:
+                pass
+        if not found_magic:
+            reasons.append("missing encoding magic comment")
+        reasons.append(
+            "bytes are not valid UTF-8 ({0}: {1})".format(
+                type(exc).__name__, exc))
+        message = (
+            "Encoding detection failed for {0!r}: {1}. "
+            "Please add a coding declaration (PEP 263) or save as UTF-8."
+        ).format(filename, "; ".join(reasons))
+        raise UnspecifiedEncodingError(message)
+
+
+class UnspecifiedEncodingError(UnicodeError):
+    """Raised when a file lacks an explicit encoding and is not valid UTF-8."""
+    pass
 
 
 def readlines_from_file(filename):
@@ -901,13 +976,24 @@ class FixPEP8(object):
     def fix_e302(self, result):
         """Add missing 2 blank lines."""
         add_linenum = 2 - int(result['info'].split()[-1])
-        offset = 1
-        if self.source[result['line'] - 2].strip() == "\\":
-            offset = 2
+        line = result['line'] - 1
+        # Walk backward past decorator lines and line-continuations
+        # to find the real start of the definition.
+        target = line
+        while target > 0:
+            prev = self.source[target - 1]
+            stripped = prev.rstrip('\n').rstrip()
+            # Decorator line?
+            if stripped.lstrip().startswith('@'):
+                target -= 1
+                continue
+            # Line ends with backslash continuation?
+            if stripped.endswith('\\'):
+                target -= 1
+                continue
+            break
         cr = '\n' * add_linenum
-        self.source[result['line'] - offset] = (
-            cr + self.source[result['line'] - offset]
-        )
+        self.source[target] = cr + self.source[target]
 
     def fix_e303(self, result):
         """Remove extra blank lines."""
@@ -1181,6 +1267,13 @@ class FixPEP8(object):
         center = target[offset:right_offset]
         right = target[right_offset:].lstrip()
 
+        if RISKY_EQ_OVERLOAD_IDENTS.search(left):
+            return []
+
+        if (CHAINED_COMPARE_REGEX.search(left) or
+                CHAINED_COMPARE_REGEX.search(right)):
+            return []
+
         if center.strip() == '==':
             new_center = 'is'
         elif center.strip() == '!=':
@@ -1211,22 +1304,113 @@ class FixPEP8(object):
             center = target[offset:right_offset]
             right = target[right_offset:].lstrip()
 
-            # Handle simple cases only.
-            new_right = None
-            if center.strip() == '==':
-                if re.match(r'\bTrue\b', right):
-                    new_right = re.sub(r'\bTrue\b *', '', right, count=1)
-            elif center.strip() == '!=':
-                if re.match(r'\bFalse\b', right):
-                    new_right = re.sub(r'\bFalse\b *', '', right, count=1)
-
-            if new_right is None:
+            if RISKY_EQ_OVERLOAD_IDENTS.search(left):
                 return []
 
-            if new_right[0].isalnum():
-                new_right = ' ' + new_right
+            if (CHAINED_COMPARE_REGEX.search(left) or
+                    CHAINED_COMPARE_REGEX.search(right)):
+                return []
 
-            self.source[line_index] = left + new_right
+            # Extract the LHS expression (strip any leading statement context)
+            # We want the rightmost meaningful expression that is being
+            # compared to True/False.
+            m = re.search(
+                r'([A-Za-z_][A-Za-z0-9_]*'
+                r'|[\w."\'\[\]]+)\s*$',
+                left)
+            if not m:
+                return []
+            lhs_expr = m.group(1)
+
+            # What is before the LHS? Keep the trailing whitespace separate so we
+            # don't lose spacing in the final output.
+            _before_with_space = left[:m.start()]
+            before_lhs = _before_with_space.rstrip()
+            _leading_ws = _before_with_space[len(before_lhs):]
+            # Check if before_lhs ends with something that indicates the
+            # comparison is at top-level statement context (just if/elif/
+            # while + space, or whitespace only, or simple assignment).
+            simple_context = False
+            if before_lhs == '' or before_lhs.isspace():
+                simple_context = True
+            elif re.match(r'^\s*(if|elif|while|assert)\s*$', before_lhs):
+                simple_context = True
+            elif re.match(r'^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*$', before_lhs):
+                simple_context = True
+            # Additionally allow chain of similar comparisons preceded by
+            # and/or - still drop for simple identifiers since the whole
+            # thing is still a boolean context (not function args / return).
+            elif re.search(
+                    r'\b(and|or)\s*$',
+                    before_lhs.rstrip()):
+                simple_context = True
+            # Also allow leading open paren / other open brackets followed by
+            # the conditions above. E.g. "if (foo" -> before is "if ("
+            elif re.match(
+                    r'^\s*(?:if|elif|while|assert)\s*[\[\(\{]\s*$',
+                    before_lhs):
+                simple_context = True
+            elif re.search(
+                    r'[\[\(\{]\s*$',
+                    before_lhs.rstrip()):
+                # just an opening bracket at the very end -> still boolean
+                # context, safe to strip simple ident
+                opening_idx = before_lhs.rstrip().rfind('(')
+                opening_idx2 = before_lhs.rstrip().rfind('[')
+                opening_idx3 = before_lhs.rstrip().rfind('{')
+                last_open = max(opening_idx, opening_idx2, opening_idx3)
+                if last_open >= 0:
+                    before_inner = before_lhs.rstrip()[:last_open].rstrip()
+                    if (before_inner == '' or
+                            re.match(r'^\s*(if|elif|while|assert)\s*$',
+                                     before_inner) or
+                            re.search(r'\b(and|or)\s*$',
+                                      before_inner.rstrip())):
+                        simple_context = True
+
+            center_text = center.strip()
+            rhs_match = None
+            op_kind = None  # 'eq_true' or 'neq_false'
+            if center_text == '==':
+                rhs_match = re.match(r'\b(True)\b', right)
+                if rhs_match:
+                    op_kind = 'eq_true'
+            elif center_text == '!=':
+                rhs_match = re.match(r'\b(False)\b', right)
+                if rhs_match:
+                    op_kind = 'neq_false'
+
+            if op_kind is None:
+                return []
+
+            rest = right[rhs_match.end():]
+            # Keep rest intact (only strip the matched True/False token)
+            if rest and not rest[:1].isspace() and not rest[:1] in ':,)]}':
+                rest = ' ' + rest
+
+            lhs_is_simple = bool(SIMPLE_IDENT_REGEX.match(lhs_expr))
+            can_strip = (
+                simple_context and lhs_is_simple and
+                not RISKY_EQ_OVERLOAD_IDENTS.search(lhs_expr)
+            )
+
+            if can_strip:
+                # Legacy behaviour: drop True/False and the operator.
+                # Reconstruct: before_with_space + lhs_expr + rest
+                self.source[line_index] = (
+                    _before_with_space + lhs_expr + rest
+                )
+            else:
+                # Safe behaviour: keep True/False, switch to "is" operator.
+                new_center = 'is' if op_kind == 'eq_true' else 'is not'
+                new_right_token = rhs_match.group(1)
+                span_start = m.start()
+                replacement = (
+                    lhs_expr + ' ' + new_center + ' ' + new_right_token
+                )
+                self.source[line_index] = (
+                    left[:span_start] + replacement + rest
+                )
 
     def fix_e713(self, result):
         """Fix (trivial case of) non-membership check."""
@@ -1398,8 +1582,11 @@ class FixPEP8(object):
                 blank_count += 1
 
         original_length = len(self.source)
-        self.source = self.source[:original_length - blank_count]
-        return range(1, 1 + original_length)
+        if blank_count:
+            self.source = self.source[:original_length - blank_count]
+            first_deleted = original_length - blank_count + 1
+            return range(first_deleted, original_length + 1)
+        return []
 
     def fix_w503(self, result):
         (line_index, _, target) = get_index_offset_contents(result,
@@ -4471,7 +4658,7 @@ def _fix_file(parameters):
         print('[file:{}]'.format(parameters[0]), file=sys.stderr)
     try:
         return fix_file(*parameters)
-    except IOError as error:
+    except (IOError, UnspecifiedEncodingError) as error:
         print(str(error), file=sys.stderr)
         raise error
 
@@ -4528,7 +4715,7 @@ def is_python_file(filename):
             if not text:
                 return False
             first_line = text.splitlines()[0]
-    except (IOError, IndexError):
+    except (IOError, IndexError, UnspecifiedEncodingError):
         return False
 
     if not PYTHON_SHEBANG_REGEX.match(first_line):
@@ -4614,6 +4801,9 @@ def main(argv=None, apply_config=True):
             if args.exit_code and ret:
                 return EXIT_CODE_EXISTS_DIFF
     except IOError:
+        return EXIT_CODE_ERROR
+    except UnspecifiedEncodingError as error:
+        print(str(error), file=sys.stderr)
         return EXIT_CODE_ERROR
     except KeyboardInterrupt:
         return EXIT_CODE_ERROR  # pragma: no cover
