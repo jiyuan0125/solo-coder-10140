@@ -129,6 +129,25 @@ CHAINED_COMPARE_REGEX = re.compile(
     r'\s(==|!=|is\s+not|is|<|>|<=|>=)\s'
 )
 
+RISKY_EQ_MODULE_NAMES = frozenset([
+    'numpy', 'pandas', 'sqlalchemy', 'mock',
+    'unittest.mock',
+])
+RISKY_EQ_IMPORTED_NAMES = frozenset([
+    'numpy', 'pandas', 'sqlalchemy', 'mock',
+    'np', 'pd', 'sa',
+    'Mock', 'MagicMock', 'patch', 'create_autospec',
+    'DataFrame', 'Series', 'Column',
+])
+RISKY_EQ_IDENTIFIER_KEYWORDS = (
+    'numpy', 'pandas', 'sqlalchemy',
+    'dataframe', 'series', 'column',
+    'mock',
+)
+_IDENTIFIER_REGEX = re.compile(r'\b([A-Za-z_][A-Za-z0-9_]*)\b')
+_IMPORT_AS_REGEX = re.compile(r'^\s*import\s+([^\s#;]+)')
+_FROM_IMPORT_REGEX = re.compile(r'^\s*from\s+(\S+)\s+import\s+(.+)$')
+
 EXIT_CODE_OK = 0
 EXIT_CODE_ERROR = 1
 EXIT_CODE_EXISTS_DIFF = 2
@@ -590,6 +609,14 @@ class FixPEP8(object):
         self.fix_e703 = self.fix_e702
         self.fix_w292 = self.fix_w291
         self.fix_w293 = self.fix_w291
+
+        self._eq_risk_aliases = None
+
+    def _get_eq_risk_aliases(self):
+        """Return cached set of import aliases indicating overloaded == risk."""
+        if self._eq_risk_aliases is None:
+            self._eq_risk_aliases = _parse_import_aliases(self.imports)
+        return self._eq_risk_aliases
 
     def _check_affected_anothers(self, result) -> bool:
         """Check if the fix affects the number of lines of another remark."""
@@ -1250,7 +1277,8 @@ class FixPEP8(object):
         if _is_chained_comparison(left, right, none_on_right):
             return []
 
-        if _has_overloaded_eq_risk(left if none_on_right else right):
+        if _has_overloaded_eq_risk(left if none_on_right else right,
+                                   self._get_eq_risk_aliases()):
             return []
 
         self.source[line_index] = ' '.join([left, new_center, right])
@@ -1300,7 +1328,7 @@ class FixPEP8(object):
             if not handled:
                 return []
 
-            if _has_overloaded_eq_risk(left):
+            if _has_overloaded_eq_risk(left, self._get_eq_risk_aliases()):
                 return []
 
             self.source[line_index] = ' '.join([left, new_center, right])
@@ -1719,15 +1747,93 @@ def get_index_offset_contents(result, source):
             source[line_index])
 
 
-def _has_overloaded_eq_risk(text):
+def _parse_import_aliases(imports_dict):
+    """Parse import lines and return set of aliases for risky libraries.
+
+    Recognises:
+        import X [as Y]
+        from A import B [as C]
+    Returns a set of alias names that are risky (numpy/pandas/sqlalchemy/mock
+    related).
+    """
+    aliases = set()
+    for line in imports_dict:
+        stripped = line.strip()
+        m_import = _IMPORT_AS_REGEX.match(stripped)
+        if m_import:
+            specs = [s.strip() for s in m_import.group(1).split(',')]
+            for spec in specs:
+                parts = re.split(r'\s+as\s+', spec)
+                module_name = parts[0].strip()
+                alias = parts[1].strip() if len(parts) > 1 else module_name.split('.')[-1]
+                if (module_name in RISKY_EQ_MODULE_NAMES or
+                        alias in RISKY_EQ_IMPORTED_NAMES):
+                    aliases.add(alias)
+                if '.' in module_name:
+                    top = module_name.split('.')[0]
+                    if top in RISKY_EQ_MODULE_NAMES:
+                        aliases.add(alias)
+            continue
+        m_from = _FROM_IMPORT_REGEX.match(stripped)
+        if m_from:
+            from_module = m_from.group(1)
+            imports_clause = m_from.group(2).strip()
+            if imports_clause.startswith('(') and imports_clause.endswith(')'):
+                imports_clause = imports_clause[1:-1]
+            from_risky = (from_module in RISKY_EQ_MODULE_NAMES or
+                          from_module.startswith('unittest.mock') or
+                          from_module.split('.')[0] in RISKY_EQ_MODULE_NAMES)
+            if from_risky:
+                for item in [s.strip() for s in imports_clause.split(',')]:
+                    if not item:
+                        continue
+                    if item == '*':
+                        continue
+                    parts = re.split(r'\s+as\s+', item)
+                    orig = parts[0].strip()
+                    alias = parts[1].strip() if len(parts) > 1 else orig
+                    aliases.add(alias)
+            for item in [s.strip() for s in imports_clause.split(',')]:
+                if not item:
+                    continue
+                parts = re.split(r'\s+as\s+', item)
+                orig = parts[0].strip()
+                alias = parts[1].strip() if len(parts) > 1 else orig
+                if orig in RISKY_EQ_IMPORTED_NAMES or alias in RISKY_EQ_IMPORTED_NAMES:
+                    aliases.add(alias)
+    return aliases
+
+
+def _identifier_has_risky_keyword(name):
+    """Check if an identifier name contains risky keywords like numpy/pandas."""
+    lower = name.lower()
+    return any(kw in lower for kw in RISKY_EQ_IDENTIFIER_KEYWORDS)
+
+
+def _has_overloaded_eq_risk(text, import_aliases=None):
     """Return True if text contains identifiers suggesting overloaded ==.
 
     These identifiers are typically associated with libraries like numpy,
     pandas, SQLAlchemy, mock, etc. where ``==`` and ``is`` have different
     semantics.
+
+    Checks (in order):
+      1. Hardcoded prefix/attribute/call regex patterns (existing fallback).
+      2. Identifier matches with known import aliases (from parsed imports).
+      3. Identifier names contain risky keywords (numpy/pandas/...).
+      4. Nested brackets containing a comparison operator (function arg case).
     """
     if OVERLOADED_EQ_RISK_REGEX.search(text):
         return True
+
+    stripped = _strip_strings_and_comments(text)
+    for match in _IDENTIFIER_REGEX.finditer(stripped):
+        ident = match.group(1)
+        if import_aliases and ident in import_aliases:
+            return True
+        if _identifier_has_risky_keyword(ident):
+            return True
+
     depth = 0
     i = 0
     while i < len(text):
