@@ -114,6 +114,20 @@ COMPARE_TYPE_REGEX = re.compile(
     r'|\btype(?:\s*\(\s*([^)]*[^ )])\s*\))\s+([=!]=)'
 )
 TYPE_REGEX = re.compile(r'(type\s*\(\s*[^)]*?[^\s)]\s*\))')
+OVERLOADED_EQ_RISK_PATTERNS = (
+    r'\bnp\.', r'\bnumpy\.', r'\bpd\.', r'\bpandas\.',
+    r'\bsa\.', r'\bsqlalchemy\.', r'\bmock\.',
+    r'\.iloc\[', r'\.loc\[', r'\.iat\[', r'\.at\[',
+    r'\.values\b', r'\.columns?\b', r'\.dtypes?\b',
+    r'\bMock\s*\(', r'\bMagicMock\s*\(', r'\bcreate_autospec\s*\(',
+    r'\.query\s*\(', r'\.filter\s*\(', r'\.Column\s*\(',
+    r'\bDataFrame\s*\(', r'\bSeries\s*\(',
+    r'\.groupby\s*\(', r'\.merge\s*\(',
+)
+OVERLOADED_EQ_RISK_REGEX = re.compile('|'.join(OVERLOADED_EQ_RISK_PATTERNS))
+CHAINED_COMPARE_REGEX = re.compile(
+    r'\s(==|!=|is\s+not|is|<|>|<=|>=)\s'
+)
 
 EXIT_CODE_OK = 0
 EXIT_CODE_ERROR = 1
@@ -173,33 +187,76 @@ def open_with_encoding(filename, mode='r', encoding=None, limit_byte_check=-1):
 
 
 def _detect_encoding_from_file(filename: str):
+    """Detect encoding markers from a file.
+
+    Returns a tuple of (encoding, source_flags) where source_flags is a set
+    containing any of: 'bom', 'magic_comment'. If empty, no explicit encoding
+    was declared.
+    """
+    flags = set()
+    detected_encoding = None
     try:
-        with open(filename) as input_file:
-            for idx, line in enumerate(input_file):
-                if idx == 0 and line[0] == '\ufeff':
-                    return "utf-8-sig"
-                if idx >= 2:
-                    break
-                match = ENCODING_MAGIC_COMMENT.search(line)
-                if match:
-                    return match.groups()[0]
-    except Exception:
+        with open(filename, 'rb') as raw_file:
+            raw_head = raw_file.read(MAX_PYTHON_FILE_DETECTION_BYTES)
+
+        if raw_head[:3] == b'\xef\xbb\xbf':
+            flags.add('bom')
+            detected_encoding = "utf-8-sig"
+            return (detected_encoding, flags)
+
+        try:
+            head_text = raw_head.decode('utf-8')
+        except UnicodeDecodeError:
+            head_text = raw_head.decode('latin-1')
+
+        for idx, line in enumerate(head_text.splitlines()):
+            if idx >= 2:
+                break
+            match = ENCODING_MAGIC_COMMENT.search(line)
+            if match:
+                flags.add('magic_comment')
+                detected_encoding = match.groups()[0]
+                return (detected_encoding, flags)
+    except OSError:
         pass
-    # Python3's default encoding
-    return 'utf-8'
+
+    if detected_encoding is None:
+        detected_encoding = 'utf-8'
+    return (detected_encoding, flags)
 
 
 def detect_encoding(filename, limit_byte_check=-1):
-    """Return file encoding."""
-    encoding = _detect_encoding_from_file(filename)
+    """Return file encoding.
+
+    Raises EncodingDetectionError if no explicit encoding is declared and
+    the file content cannot be decoded as UTF-8.
+    """
+    encoding, flags = _detect_encoding_from_file(filename)
     if encoding == "utf-8-sig":
         return encoding
     try:
         with open_with_encoding(filename, encoding=encoding) as test_file:
             test_file.read(limit_byte_check)
         return encoding
-    except (LookupError, SyntaxError, UnicodeDecodeError):
-        return 'latin-1'
+    except (LookupError, SyntaxError, UnicodeDecodeError) as exc:
+        if 'bom' in flags:
+            reason = "BOM present but declared encoding failed to decode"
+        elif 'magic_comment' in flags:
+            reason = (
+                f"magic comment declares encoding='{encoding}' but it "
+                f"failed to decode the file"
+            )
+        else:
+            reason = (
+                "no BOM and no encoding magic comment found; file bytes "
+                "are not valid UTF-8"
+            )
+        raise EncodingDetectionError(
+            f"Failed to detect encoding for '{filename}': {reason}. "
+            f"Please add an encoding magic comment (e.g. "
+            f"# -*- coding: utf-8 -*-) or save the file as UTF-8. "
+            f"Original error: {type(exc).__name__}: {exc}"
+        )
 
 
 def readlines_from_file(filename):
@@ -901,9 +958,8 @@ class FixPEP8(object):
     def fix_e302(self, result):
         """Add missing 2 blank lines."""
         add_linenum = 2 - int(result['info'].split()[-1])
-        offset = 1
-        if self.source[result['line'] - 2].strip() == "\\":
-            offset = 2
+        def_line_idx = result['line'] - 1
+        offset = _find_e302_insert_offset(self.source, def_line_idx)
         cr = '\n' * add_linenum
         self.source[result['line'] - offset] = (
             cr + self.source[result['line'] - offset]
@@ -1188,6 +1244,15 @@ class FixPEP8(object):
         else:
             return []
 
+        none_on_right = re.match(r'\bNone\b', right) is not None
+        none_on_left = re.search(r'\bNone\b\s*$', left) is not None
+
+        if _is_chained_comparison(left, right, none_on_right):
+            return []
+
+        if _has_overloaded_eq_risk(left if none_on_right else right):
+            return []
+
         self.source[line_index] = ' '.join([left, new_center, right])
 
     def fix_e712(self, result):
@@ -1202,6 +1267,12 @@ class FixPEP8(object):
         elif re.match(r'^\s*if [\w."\'\[\]]+ != True:$', target):
             self.source[line_index] = re.sub(r'if ([\w."\'\[\]]+) != True:',
                                              r'if not \1:', target, count=1)
+        elif re.match(r'^\s*if [\w."\'\[\]]+ == True:$', target):
+            self.source[line_index] = re.sub(r'if ([\w."\'\[\]]+) == True:',
+                                             r'if \1:', target, count=1)
+        elif re.match(r'^\s*if [\w."\'\[\]]+ != False:$', target):
+            self.source[line_index] = re.sub(r'if ([\w."\'\[\]]+) != False:',
+                                             r'if \1:', target, count=1)
         else:
             right_offset = offset + 2
             if right_offset >= len(target):
@@ -1211,22 +1282,29 @@ class FixPEP8(object):
             center = target[offset:right_offset]
             right = target[right_offset:].lstrip()
 
-            # Handle simple cases only.
-            new_right = None
-            if center.strip() == '==':
-                if re.match(r'\bTrue\b', right):
-                    new_right = re.sub(r'\bTrue\b *', '', right, count=1)
-            elif center.strip() == '!=':
-                if re.match(r'\bFalse\b', right):
-                    new_right = re.sub(r'\bFalse\b *', '', right, count=1)
+            true_on_right = re.match(r'\bTrue\b', right) is not None
+            false_on_right = re.match(r'\bFalse\b', right) is not None
 
-            if new_right is None:
+            if center.strip() not in ('==', '!='):
                 return []
 
-            if new_right[0].isalnum():
-                new_right = ' ' + new_right
+            handled = False
+            new_center = None
+            if center.strip() == '==' and true_on_right:
+                handled = True
+                new_center = 'is'
+            elif center.strip() == '!=' and false_on_right:
+                handled = True
+                new_center = 'is not'
 
-            self.source[line_index] = left + new_right
+            if not handled:
+                return []
+
+            if _has_overloaded_eq_risk(left):
+                return []
+
+            self.source[line_index] = ' '.join([left, new_center, right])
+            return []
 
     def fix_e713(self, result):
         """Fix (trivial case of) non-membership check."""
@@ -1390,6 +1468,7 @@ class FixPEP8(object):
     def fix_w391(self, _):
         """Remove trailing blank lines."""
         blank_count = 0
+        original_length = len(self.source)
         for line in reversed(self.source):
             line = line.rstrip()
             if line:
@@ -1397,9 +1476,14 @@ class FixPEP8(object):
             else:
                 blank_count += 1
 
-        original_length = len(self.source)
-        self.source = self.source[:original_length - blank_count]
-        return range(1, 1 + original_length)
+        if blank_count > 0:
+            modified_lines = list(range(
+                original_length - blank_count + 1,
+                original_length + 1
+            ))
+            self.source = self.source[:original_length - blank_count]
+            return modified_lines
+        return []
 
     def fix_w503(self, result):
         (line_index, _, target) = get_index_offset_contents(result,
@@ -1633,6 +1717,183 @@ def get_index_offset_contents(result, source):
     return (line_index,
             result['column'] - 1,
             source[line_index])
+
+
+def _has_overloaded_eq_risk(text):
+    """Return True if text contains identifiers suggesting overloaded ==.
+
+    These identifiers are typically associated with libraries like numpy,
+    pandas, SQLAlchemy, mock, etc. where ``==`` and ``is`` have different
+    semantics.
+    """
+    if OVERLOADED_EQ_RISK_REGEX.search(text):
+        return True
+    depth = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            depth -= 1
+        elif depth > 0 and ch in '=!' and i + 1 < len(text) and text[i+1] == '=':
+            return True
+        i += 1
+    return False
+
+
+def _strip_strings_and_comments(text):
+    """Remove string literals and comments from text for analysis."""
+    result = []
+    i = 0
+    in_single = False
+    in_double = False
+    in_triple_single = False
+    in_triple_double = False
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i+1] if i + 1 < len(text) else ''
+        nxt2 = text[i+2] if i + 2 < len(text) else ''
+        if not in_single and not in_double and not in_triple_single and not in_triple_double:
+            if ch == '#' and nxt != '{':
+                break
+            elif ch == "'" and nxt == "'" and nxt2 == "'":
+                in_triple_single = True
+                result.append('   ')
+                i += 3
+                continue
+            elif ch == '"' and nxt == '"' and nxt2 == '"':
+                in_triple_double = True
+                result.append('   ')
+                i += 3
+                continue
+            elif ch == "'":
+                in_single = True
+                result.append(' ')
+                i += 1
+                continue
+            elif ch == '"':
+                in_double = True
+                result.append(' ')
+                i += 1
+                continue
+        else:
+            if in_triple_single and ch == "'" and nxt == "'" and nxt2 == "'":
+                in_triple_single = False
+                result.append('   ')
+                i += 3
+                continue
+            elif in_triple_double and ch == '"' and nxt == '"' and nxt2 == '"':
+                in_triple_double = False
+                result.append('   ')
+                i += 3
+                continue
+            elif in_single and ch == "'" and text[i-1] != '\\':
+                in_single = False
+                result.append(' ')
+                i += 1
+                continue
+            elif in_double and ch == '"' and text[i-1] != '\\':
+                in_double = False
+                result.append(' ')
+                i += 1
+                continue
+            result.append(' ')
+            i += 1
+            continue
+        result.append(ch)
+        i += 1
+    return ''.join(result)
+
+
+def _is_chained_comparison(left, right, none_on_right):
+    """Check if a == comparison with None is part of a Python chained comparison.
+
+    For example: ``a == None == b`` is a chained comparison. Converting either
+    ``==`` to ``is`` independently would break the chain.
+    """
+    CMP_OPS = ('==', '!=', '<=', '>=', '<', '>')
+
+    if none_on_right:
+        stripped_right = right.lstrip()
+        m = re.match(r'\bNone\b(.*)', stripped_right, re.DOTALL)
+        if m:
+            after_none = m.group(1)
+            after_none_stripped = after_none.lstrip()
+            for op in CMP_OPS:
+                if _strip_strings_and_comments(after_none_stripped).startswith(op):
+                    return True
+    else:
+        stripped_left = left.rstrip()
+        m = re.match(r'(.*?)\bNone\b$', stripped_left, re.DOTALL)
+        if m:
+            before_none = m.group(1)
+            before_none_stripped = before_none.rstrip()
+            for op in CMP_OPS:
+                if _strip_strings_and_comments(before_none_stripped).endswith(op):
+                    return True
+
+        stripped_right = right.lstrip()
+        right_clean = _strip_strings_and_comments(stripped_right)
+        depth = 0
+        i = 0
+        while i < len(right_clean):
+            ch = right_clean[i]
+            if ch in '([{':
+                depth += 1
+                i += 1
+            elif ch in ')]}':
+                depth -= 1
+                i += 1
+            elif depth == 0:
+                rest = right_clean[i:]
+                matched = False
+                for kw in (' and ', ' or '):
+                    if rest.lower().startswith(kw):
+                        return False
+                for op in CMP_OPS:
+                    if rest.startswith(op):
+                        return True
+                    elif rest.startswith(' is not '):
+                        return True
+                    elif rest.startswith(' is ') and not rest.startswith(' is not'):
+                        return True
+                i += 1
+            else:
+                i += 1
+
+    return False
+
+
+def _find_e302_insert_offset(source, def_line_index):
+    """Find correct line offset for inserting blank lines before def/class.
+
+    Handles decorators and backslash line continuation.
+    """
+    if def_line_index <= 0:
+        return 1
+    i = def_line_index - 1
+    while i >= 0:
+        line = source[i].strip()
+        if line == '\\':
+            i -= 1
+            continue
+        if line.endswith('\\'):
+            i -= 1
+            continue
+        if line.startswith('@'):
+            i -= 1
+            continue
+        break
+    actual_before = def_line_index - 1 - i
+    if actual_before > 0:
+        return actual_before + 1
+    return 1
+
+
+class EncodingDetectionError(Exception):
+    """Raised when encoding detection fails for a file."""
+    pass
 
 
 def get_fixed_long_line(target, previous_line, original,
@@ -4528,7 +4789,7 @@ def is_python_file(filename):
             if not text:
                 return False
             first_line = text.splitlines()[0]
-    except (IOError, IndexError):
+    except (IOError, IndexError, EncodingDetectionError):
         return False
 
     if not PYTHON_SHEBANG_REGEX.match(first_line):

@@ -87,18 +87,16 @@ class UnitTests(unittest.TestCase):
                 os.path.join(ROOT_DIR, 'test', 'iso_8859_1.py')))
 
     def test_readlines_from_file_with_bad_encoding(self):
-        """Bad encoding should not cause an exception."""
-        self.assertEqual(
-            ['# -*- coding: zlatin-1 -*-\n'],
-            autopep8.readlines_from_file(
-                os.path.join(ROOT_DIR, 'test', 'bad_encoding.py')))
+        """Invalid encoding name should raise EncodingDetectionError."""
+        self.assertRaises(
+            autopep8.EncodingDetectionError,
+            autopep8.readlines_from_file,
+            os.path.join(ROOT_DIR, 'test', 'bad_encoding.py'))
 
     def test_readlines_from_file_with_bad_encoding2(self):
-        """Bad encoding should not cause an exception."""
-        # This causes a warning on Python 3.
-        with warnings.catch_warnings(record=True):
-            self.assertTrue(autopep8.readlines_from_file(
-                os.path.join(ROOT_DIR, 'test', 'bad_encoding2.py')))
+        """File with BOM and valid UTF-8 content should not cause exception."""
+        self.assertTrue(autopep8.readlines_from_file(
+            os.path.join(ROOT_DIR, 'test', 'bad_encoding2.py')))
 
     def test_fix_whitespace(self):
         self.assertEqual(
@@ -4214,21 +4212,21 @@ def example2(): return ('' in {'f': 2}) in {'has_key() is deprecated': True}
 
     def test_e712(self):
         line = 'foo == True\n'
-        fixed = 'foo\n'
+        fixed = 'foo is True\n'
         with autopep8_context(line,
                               options=['-aa', '--select=E712']) as result:
             self.assertEqual(fixed, result)
 
     def test_e712_in_conditional_with_multiple_instances(self):
         line = 'if foo == True and bar == True:\npass\n'
-        fixed = 'if foo and bar:\npass\n'
+        fixed = 'if foo is True and bar is True:\npass\n'
         with autopep8_context(line,
                               options=['-aa', '--select=E712']) as result:
             self.assertEqual(fixed, result)
 
     def test_e712_with_false(self):
         line = 'foo != False\n'
-        fixed = 'foo\n'
+        fixed = 'foo is not False\n'
         with autopep8_context(line,
                               options=['-aa', '--select=E712']) as result:
             self.assertEqual(fixed, result)
@@ -4261,7 +4259,7 @@ def example2(): return ('' in {'f': 2}) in {'has_key() is deprecated': True}
 
     def test_e711_and_e712(self):
         line = 'if (foo == None and bar == True) or (foo != False and bar != None):\npass\n'
-        fixed = 'if (foo is None and bar) or (foo and bar is not None):\npass\n'
+        fixed = 'if (foo is None and bar is True) or (foo is not False and bar is not None):\npass\n'
         with autopep8_context(line, options=['-aa']) as result:
             self.assertEqual(fixed, result)
 
