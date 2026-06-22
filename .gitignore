@@ -1,5 +1,6 @@
 .eggs
 .idea/
+.vscode/
 *.class
 *.egg-info/
 *.egg/
