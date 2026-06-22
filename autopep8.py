@@ -120,6 +120,16 @@ EXIT_CODE_ERROR = 1
 EXIT_CODE_EXISTS_DIFF = 2
 EXIT_CODE_ARGPARSE_ERROR = 99
 
+_EQ_OVERLOADED_ROOT_IDENTIFIERS = frozenset({
+    'np', 'numpy', 'pd', 'pandas', 'df', 'sa', 'sqlalchemy',
+    'Mock', 'MagicMock', 'mock', 'MagicProxy', 'ndarray',
+    'DataFrame', 'Series', 'Column', 'InstrumentedAttribute',
+})
+
+_CHAINED_CMP_TOKENS = frozenset({
+    '==', '!=', '<', '>', '<=', '>=', 'is', 'in',
+})
+
 # For generating line shortening candidates.
 SHORTEN_OPERATOR_GROUPS = frozenset([
     frozenset([',']),
@@ -172,6 +182,40 @@ def open_with_encoding(filename, mode='r', encoding=None, limit_byte_check=-1):
                    newline='')  # Preserve line endings
 
 
+class EncodingDetectionError(ValueError):
+    pass
+
+
+def _check_bom(filename):
+    try:
+        with open(filename, 'rb') as f:
+            header = f.read(4)
+        if header[:3] == b'\xef\xbb\xbf':
+            return 'utf-8-sig'
+        if header[:2] in (b'\xff\xfe', b'\xfe\xff'):
+            return 'utf-16'
+        if header[:4] in (b'\xff\xfe\x00\x00', b'\x00\x00\xfe\xff'):
+            return 'utf-32'
+    except Exception:
+        pass
+    return None
+
+
+def _check_magic_comment(filename):
+    try:
+        with open(filename, 'rb') as f:
+            for idx, raw_line in enumerate(f):
+                if idx >= 2:
+                    break
+                line = raw_line.decode('ascii', errors='replace')
+                match = ENCODING_MAGIC_COMMENT.search(line)
+                if match:
+                    return match.groups()[0]
+    except Exception:
+        pass
+    return None
+
+
 def _detect_encoding_from_file(filename: str):
     try:
         with open(filename) as input_file:
@@ -185,7 +229,6 @@ def _detect_encoding_from_file(filename: str):
                     return match.groups()[0]
     except Exception:
         pass
-    # Python3's default encoding
     return 'utf-8'
 
 
@@ -194,11 +237,25 @@ def detect_encoding(filename, limit_byte_check=-1):
     encoding = _detect_encoding_from_file(filename)
     if encoding == "utf-8-sig":
         return encoding
+    has_magic = _check_magic_comment(filename)
     try:
         with open_with_encoding(filename, encoding=encoding) as test_file:
             test_file.read(limit_byte_check)
         return encoding
     except (LookupError, SyntaxError, UnicodeDecodeError):
+        if not has_magic and encoding == 'utf-8':
+            reasons = []
+            bom = _check_bom(filename)
+            if not bom:
+                reasons.append("no BOM marker found")
+            else:
+                reasons.append(
+                    "BOM indicates '{}' but decode failed".format(bom))
+            reasons.append("no encoding magic comment found")
+            reasons.append("UTF-8 decode failed")
+            raise EncodingDetectionError(
+                "Cannot detect encoding for '{}': {}".format(
+                    filename, '; '.join(reasons)))
         return 'latin-1'
 
 
@@ -901,12 +958,18 @@ class FixPEP8(object):
     def fix_e302(self, result):
         """Add missing 2 blank lines."""
         add_linenum = 2 - int(result['info'].split()[-1])
-        offset = 1
-        if self.source[result['line'] - 2].strip() == "\\":
-            offset = 2
+        target_index = result['line'] - 1
+        while target_index > 0:
+            prev = self.source[target_index - 1]
+            if prev.rstrip().endswith('\\'):
+                target_index -= 1
+            elif prev.lstrip().startswith('@'):
+                target_index -= 1
+            else:
+                break
         cr = '\n' * add_linenum
-        self.source[result['line'] - offset] = (
-            cr + self.source[result['line'] - offset]
+        self.source[target_index] = (
+            cr + self.source[target_index]
         )
 
     def fix_e303(self, result):
@@ -1188,6 +1251,12 @@ class FixPEP8(object):
         else:
             return []
 
+        if _is_chained_comparison(target, offset, right_offset):
+            return []
+
+        if _has_eq_overload_risk(left):
+            return []
+
         self.source[line_index] = ' '.join([left, new_center, right])
 
     def fix_e712(self, result):
@@ -1211,22 +1280,28 @@ class FixPEP8(object):
             center = target[offset:right_offset]
             right = target[right_offset:].lstrip()
 
-            # Handle simple cases only.
-            new_right = None
             if center.strip() == '==':
                 if re.match(r'\bTrue\b', right):
-                    new_right = re.sub(r'\bTrue\b *', '', right, count=1)
+                    new_center = 'is'
+                    new_right = re.sub(r'\bTrue\b', 'True', right, count=1)
+                elif re.match(r'\bFalse\b', right):
+                    new_center = 'is'
+                    new_right = re.sub(r'\bFalse\b', 'False', right, count=1)
+                else:
+                    return []
             elif center.strip() == '!=':
                 if re.match(r'\bFalse\b', right):
-                    new_right = re.sub(r'\bFalse\b *', '', right, count=1)
-
-            if new_right is None:
+                    new_center = 'is not'
+                    new_right = re.sub(r'\bFalse\b', 'False', right, count=1)
+                elif re.match(r'\bTrue\b', right):
+                    new_center = 'is not'
+                    new_right = re.sub(r'\bTrue\b', 'True', right, count=1)
+                else:
+                    return []
+            else:
                 return []
 
-            if new_right[0].isalnum():
-                new_right = ' ' + new_right
-
-            self.source[line_index] = left + new_right
+            self.source[line_index] = ' '.join([left, new_center, new_right])
 
     def fix_e713(self, result):
         """Fix (trivial case of) non-membership check."""
@@ -1399,7 +1474,7 @@ class FixPEP8(object):
 
         original_length = len(self.source)
         self.source = self.source[:original_length - blank_count]
-        return range(1, 1 + original_length)
+        return range(original_length - blank_count + 1, 1 + original_length)
 
     def fix_w503(self, result):
         (line_index, _, target) = get_index_offset_contents(result,
@@ -1633,6 +1708,53 @@ def get_index_offset_contents(result, source):
     return (line_index,
             result['column'] - 1,
             source[line_index])
+
+
+def _has_eq_overload_risk(left_operand):
+    stripped = left_operand.strip()
+    if not stripped:
+        return False
+    match = re.search(r'([\w.]+)\s*$', stripped)
+    if not match:
+        return False
+    expr = match.group(1)
+    root = expr.split('.')[0].split('(')[0].split('[')[0].strip()
+    if root in _EQ_OVERLOADED_ROOT_IDENTIFIERS:
+        return True
+    for segment in expr.split('.'):
+        token = segment.split('(')[0].split('[')[0].strip()
+        if token in _EQ_OVERLOADED_ROOT_IDENTIFIERS:
+            return True
+    return False
+
+
+_CHAINED_NONE_RE = re.compile(
+    r'\bNone\s*(==|!=|<|>|<=|>=|is\s+not|is|in\s+not|in)\s'
+)
+
+
+def _is_chained_comparison(target, offset, right_offset):
+    right_part = target[right_offset:]
+    if _CHAINED_NONE_RE.match(right_part.lstrip()):
+        return True
+    for tok in _CHAINED_CMP_TOKENS:
+        if right_part.lstrip().startswith(tok):
+            rest = right_part.lstrip()[len(tok):].lstrip()
+            if rest and not rest.lower().startswith(('and ', 'or ')):
+                return True
+        if right_part.lstrip().startswith('not ' + tok):
+            rest = right_part.lstrip()[len('not ') + len(tok):].lstrip()
+            if rest and not rest.lower().startswith(('and ', 'or ')):
+                return True
+    left_part = target[:offset].rstrip()
+    tokens = left_part.split()
+    for i in range(len(tokens) - 1, -1, -1):
+        t = tokens[i]
+        if t in ('and', 'or'):
+            break
+        if t in _CHAINED_CMP_TOKENS or t == 'not':
+            return True
+    return False
 
 
 def get_fixed_long_line(target, previous_line, original,
@@ -4528,7 +4650,7 @@ def is_python_file(filename):
             if not text:
                 return False
             first_line = text.splitlines()[0]
-    except (IOError, IndexError):
+    except (IOError, IndexError, EncodingDetectionError):
         return False
 
     if not PYTHON_SHEBANG_REGEX.match(first_line):

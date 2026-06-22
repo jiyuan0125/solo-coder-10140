@@ -613,19 +613,15 @@ print('python')
                                     options=autopep8.parse_args(['']),
                                     contents='x != True\n')
 
-        self.assertEqual(
-            [],
-            fix_pep8.fix_e712({'line': 1,
-                               'column': 3}))
+        fix_pep8.fix_e712({'line': 1, 'column': 3})
+        self.assertEqual('x is not True\n', fix_pep8.source[0])
 
         fix_pep8 = autopep8.FixPEP8(filename='',
                                     options=autopep8.parse_args(['']),
                                     contents='x == False\n')
 
-        self.assertEqual(
-            [],
-            fix_pep8.fix_e712({'line': 1,
-                               'column': 3}))
+        fix_pep8.fix_e712({'line': 1, 'column': 3})
+        self.assertEqual('x is False\n', fix_pep8.source[0])
 
     def test_get_diff_text(self):
         # We ignore the first two lines since it differs on Python 2.6.
@@ -4214,21 +4210,21 @@ def example2(): return ('' in {'f': 2}) in {'has_key() is deprecated': True}
 
     def test_e712(self):
         line = 'foo == True\n'
-        fixed = 'foo\n'
+        fixed = 'foo is True\n'
         with autopep8_context(line,
                               options=['-aa', '--select=E712']) as result:
             self.assertEqual(fixed, result)
 
     def test_e712_in_conditional_with_multiple_instances(self):
         line = 'if foo == True and bar == True:\npass\n'
-        fixed = 'if foo and bar:\npass\n'
+        fixed = 'if foo is True and bar is True:\npass\n'
         with autopep8_context(line,
                               options=['-aa', '--select=E712']) as result:
             self.assertEqual(fixed, result)
 
     def test_e712_with_false(self):
         line = 'foo != False\n'
-        fixed = 'foo\n'
+        fixed = 'foo is not False\n'
         with autopep8_context(line,
                               options=['-aa', '--select=E712']) as result:
             self.assertEqual(fixed, result)
@@ -4261,7 +4257,7 @@ def example2(): return ('' in {'f': 2}) in {'has_key() is deprecated': True}
 
     def test_e711_and_e712(self):
         line = 'if (foo == None and bar == True) or (foo != False and bar != None):\npass\n'
-        fixed = 'if (foo is None and bar) or (foo and bar is not None):\npass\n'
+        fixed = 'if (foo is None and bar is True) or (foo is not False and bar is not None):\npass\n'
         with autopep8_context(line, options=['-aa']) as result:
             self.assertEqual(fixed, result)
 
